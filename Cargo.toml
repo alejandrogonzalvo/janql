@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rstest = "0.26.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
+
+[dev-dependencies]
+criterion = "0.5"
+rstest = "0.26.1"
 tempfile = "3.24.0"
+
+[[bench]]
+name = "benchmark_main"
+harness = false
