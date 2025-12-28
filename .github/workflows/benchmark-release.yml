@@ -13,7 +13,7 @@ jobs:
   benchmark-baseline:
     name: Generate Benchmark Baseline
     runs-on: ubuntu-latest
-    if: startsWith(github.head_ref, 'release-plz-')
+    if: startsWith(github.event.pull_request.title, 'release janql')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
