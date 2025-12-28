@@ -1,6 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use janql::Database;
 use tempfile::tempdir;
+use std::path::Path;
 
 fn benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("database_ops");
@@ -63,5 +64,9 @@ fn benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmarks);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().output_directory(Path::new("benches/baselines"));
+    targets = benchmarks
+}
 criterion_main!(benches);
