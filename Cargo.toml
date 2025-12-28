@@ -2,6 +2,8 @@
 name = "janql"
 version = "0.1.0"
 edition = "2024"
+description = "JanQL is a lightweight, persistent key-value store written in Rust."
+license = "MIT"
 
 [features]
 comparison = []
