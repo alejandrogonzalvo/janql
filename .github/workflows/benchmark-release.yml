@@ -1,0 +1,60 @@
+name: Benchmark Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark-baseline:
+    name: Generate Benchmark Baseline
+    runs-on: ubuntu-latest
+    if: startsWith(github.head_ref, 'release-plz-')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Get version from Cargo.toml
+        id: get_version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | cut -d '"' -f 2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Check if baseline already exists
+        id: check_baseline
+        run: |
+          if [ -d "benches/baselines/database_ops/write/100/v${{ env.VERSION }}" ]; then
+            echo "Baseline v${{ env.VERSION }} already exists. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Benchmarks and Save Baseline
+        if: steps.check_baseline.outputs.skip == 'false'
+        run: |
+          # Run benchmarks and save baseline with the version tag
+          cargo bench --bench benchmark_main -- --save-baseline v${{ env.VERSION }}
+
+      - name: Commit and Push Baseline
+        if: steps.check_baseline.outputs.skip == 'false'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          # Force add the baseline files (ignoring the .gitignore rules if necessary, but we want to track them)
+          # The .gitignore we added allows v* folders, so it should be fine.
+          git add benches/baselines
+          
+          git commit -m "chore: add benchmark baseline for v${{ env.VERSION }}"
+          git push
