@@ -1,118 +1,113 @@
 use janql::Database;
-use rstest::*;
-use tempfile::{tempdir, TempDir};
+use rstest::{fixture, rstest};
 use std::fs;
 use std::ops::{Deref, DerefMut};
+use tempfile::TempDir;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+struct TestDb {
+    db: Database,
+    dir: TempDir,
+}
 
-    struct TestDb {
-        db: Database,
-        dir: TempDir,
+impl Deref for TestDb {
+    type Target = Database;
+    fn deref(&self) -> &Self::Target {
+        &self.db
     }
+}
 
-    impl Deref for TestDb {
-        type Target = Database;
-        fn deref(&self) -> &Self::Target {
-            &self.db
-        }
+impl DerefMut for TestDb {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.db
     }
+}
 
-    impl DerefMut for TestDb {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.db
-        }
-    }
+#[fixture]
+fn db() -> TestDb {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("test.db");
+    let db = Database::new(&db_path);
+    TestDb { db, dir }
+}
 
-    #[fixture]
-    fn db() -> TestDb {
-        let dir = tempdir().unwrap();
-        let db = Database::new(dir.path().join("test.db"));
-        TestDb { db, dir }
-    }
+#[rstest]
+fn test_set_and_get(mut db: TestDb) {
+    db.set("key1".to_string(), "value1".to_string());
+    assert_eq!(db.get("key1"), Some("value1".to_string()));
+}
 
-    #[rstest]
-    fn test_set_and_get(mut db: TestDb) {
-        db.set("key1".into(), "value1".into());
-        db.set("key2".into(), "value2".into());
-        assert_eq!(db.get("key1"), Some(&"value1".into()));
-        assert_eq!(db.get("key2"), Some(&"value2".into()));
-    }
+#[rstest]
+fn test_get_non_existent_key(mut db: TestDb) {
+    assert_eq!(db.get("non_existent"), None);
+}
 
-    #[rstest]
-    #[should_panic]
-    fn test_get_non_existent_key(db: TestDb) {
-        db.get("non_existent");
-    }
+#[rstest]
+fn test_delete_key(mut db: TestDb) {
+    db.set("key1".to_string(), "value1".to_string());
+    db.del("key1");
+    assert_eq!(db.get("key1"), None);
+}
 
-    #[rstest]
-    fn test_delete_key(mut db: TestDb) {
-        db.set("key1".into(), "value1".into());
-        db.del("key1");
-    }
+#[rstest]
+fn test_delete_non_existent_key(mut db: TestDb) {
+    // Should not panic
+    db.del("non_existent");
+}
 
-    #[rstest]
-    #[should_panic]
-    fn test_delete_non_existent_key(mut db: TestDb) {
-        db.del("non_existent");
-    }
+#[rstest]
+fn test_log_append(mut db: TestDb) {
+    db.set("key1".to_string(), "value1".to_string());
+    db.del("key1");
 
-    #[rstest]
-    fn test_flush_database(mut db: TestDb) {
-        db.set("key1".into(), "value1".into());
-        db.set("key2".into(), "value2".into());
-        db.flush();
+    let content = fs::read_to_string(&db.path).expect("Unable to read file");
+    let lines: Vec<&str> = content.lines().collect();
 
-        let contents = fs::read_to_string(db.dir.path().join("test.db")).unwrap();
-        assert!(contents.contains("SET \"key1\" \"value1\""));
-        assert!(contents.contains("SET \"key2\" \"value2\""));
-    }
+    // Check that commands are appended
+    assert!(lines.iter().any(|line| line.contains("SET \"key1\" \"value1\"")));
+    assert!(lines.iter().any(|line| line.contains("DEL \"key1\"")));
+}
 
-    #[rstest]
-    fn test_log_append(mut db: TestDb) {
-        db.set("key1".into(), "value1".into());
-        let contents = fs::read_to_string(db.dir.path().join("test.db")).unwrap();
-        assert!(contents.contains("SET \"key1\" \"value1\""));
-        
-        db.del("key1");
-        let contents = fs::read_to_string(db.dir.path().join("test.db")).unwrap();
-        assert!(contents.contains("DEL \"key1\""));
-    }
-
-    #[test]
-    fn test_persistence() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        {
-            let mut db = Database::new(&db_path);
-            db.set("key1".into(), "value1".into());
-            db.set("key2".into(), "value2".into());
-            db.del("key2");
-        } // db dropped, file closed
-
-        let loaded_db = Database::load(&db_path).unwrap();
-        assert_eq!(loaded_db.get("key1"), Some(&"value1".into()));
-        // key2 should be deleted. get panics on missing key, so we expect panic?
-        // Or we can check if it's not there. But get panics.
-        // Let's verify key1 is there.
-    }
+#[rstest]
+fn test_flush_database(mut db: TestDb) {
+    db.set("key1".to_string(), "value1".to_string());
+    db.set("key2".to_string(), "value2".to_string());
+    db.del("key1");
     
-    #[test]
-    #[should_panic]
-    fn test_persistence_deleted_key() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        
-        {
-            let mut db = Database::new(&db_path);
-            db.set("key1".into(), "value1".into());
-            db.del("key1");
-        } 
+    db.flush();
 
-        let loaded_db = Database::load(&db_path).unwrap();
-        loaded_db.get("key1");
+    let content = fs::read_to_string(&db.path).expect("Unable to read file");
+    let lines: Vec<&str> = content.lines().collect();
+
+    // After flush, only key2 should remain
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("SET \"key2\" \"value2\""));
+}
+
+#[rstest]
+fn test_persistence() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("test_persistence.db");
+    
+    {
+        let mut db = Database::new(&db_path);
+        db.set("key1".to_string(), "value1".to_string());
+    } // db dropped here, file closed, but dir persists
+
+    let mut loaded_db = Database::load(&db_path).expect("Failed to load database");
+    assert_eq!(loaded_db.get("key1"), Some("value1".to_string()));
+}
+
+#[rstest]
+fn test_persistence_deleted_key() {
+    let dir = TempDir::new().expect("Failed to create temp dir");
+    let db_path = dir.path().join("test_persistence_del.db");
+    
+    {
+        let mut db = Database::new(&db_path);
+        db.set("key1".to_string(), "value1".to_string());
+        db.del("key1");
     }
+
+    let mut loaded_db = Database::load(&db_path).expect("Failed to load database");
+    assert_eq!(loaded_db.get("key1"), None);
 }
