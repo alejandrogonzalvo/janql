@@ -10,7 +10,7 @@ fn main() {
         None => println!("Key not found"),
     }
     
-    db.del("key1");
+    // db.del("key1");
     
     db.flush();
     

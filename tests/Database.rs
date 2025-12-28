@@ -56,15 +56,19 @@ fn test_delete_non_existent_key(mut db: TestDb) {
 
 #[rstest]
 fn test_log_append(mut db: TestDb) {
+    let initial_size = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    
     db.set("key1".to_string(), "value1".to_string());
+    let size_after_set = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    assert!(size_after_set > initial_size);
+    
     db.del("key1");
-
-    let content = fs::read_to_string(&db.path).expect("Unable to read file");
-    let lines: Vec<&str> = content.lines().collect();
-
-    // Check that commands are appended
-    assert!(lines.iter().any(|line| line.contains("SET \"key1\" \"value1\"")));
-    assert!(lines.iter().any(|line| line.contains("DEL \"key1\"")));
+    let size_after_del = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    assert!(size_after_del > size_after_set);
+    
+    // Verify content by loading
+    let mut loaded_db = Database::load(&db.path).expect("Failed to load database");
+    assert_eq!(loaded_db.get("key1"), None);
 }
 
 #[rstest]
@@ -73,14 +77,18 @@ fn test_flush_database(mut db: TestDb) {
     db.set("key2".to_string(), "value2".to_string());
     db.del("key1");
     
+    let size_before = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    
     db.flush();
 
-    let content = fs::read_to_string(&db.path).expect("Unable to read file");
-    let lines: Vec<&str> = content.lines().collect();
+    let size_after = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    
+    // Size should decrease because key1 and its deletion are removed
+    assert!(size_after < size_before);
 
-    // After flush, only key2 should remain
-    assert_eq!(lines.len(), 1);
-    assert!(lines[0].contains("SET \"key2\" \"value2\""));
+    let mut loaded_db = Database::load(&db.path).expect("Failed to load database");
+    assert_eq!(loaded_db.get("key2"), Some("value2".to_string()));
+    assert_eq!(loaded_db.get("key1"), None);
 }
 
 #[rstest]

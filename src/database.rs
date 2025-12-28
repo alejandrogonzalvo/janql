@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+const OP_SET: u8 = 1;
+const OP_DEL: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct CommandPos {
@@ -44,63 +47,43 @@ impl Database {
         let mut data = HashMap::new();
         let mut reader = BufReader::new(&file);
         let mut pos = 0;
-        let mut line = String::new();
 
-        while reader.read_line(&mut line)? > 0 {
-            let line_len = line.len() as u64;
-            // Trim newline for parsing, but keep line_len for offset tracking
-            let trimmed_line = line.trim_end();
-            
-            if trimmed_line.is_empty() { 
-                pos += line_len;
-                line.clear();
-                continue; 
+        loop {
+            let mut op_buf = [0u8; 1];
+            match reader.read_exact(&mut op_buf) {
+                Ok(_) => {},
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
             }
             
-            let parts: Vec<&str> = trimmed_line.splitn(3, ' ').collect();
-            if parts.is_empty() { 
-                pos += line_len;
-                line.clear();
-                continue; 
-            }
+            let op = op_buf[0];
+            // 1 byte for op
+            let mut current_cmd_len = 1;
 
-            match parts[0] {
-                "SET" => {
-                    if parts.len() == 3 {
-                        let key_part = parts[1];
-                        let value_part = parts[2];
-                        
-                        match serde_json::from_str::<String>(key_part) {
-                            Ok(key) => {
-                                // Calculate value offset
-                                // We need the offset of value_part within the UNTRIMMED line
-                                // Assuming standard formatting "SET key value\n"
-                                if let Some(val_offset_in_line) = line.rfind(value_part) {
-                                    let value_pos = pos + val_offset_in_line as u64;
-                                    let value_len = value_part.len() as u64;
-                                    
-                                    data.insert(key, CommandPos { pos: value_pos, len: value_len });
-                                }
-                            },
-                            Err(_) => {} // Skip malformed keys
-                        }
-                    }
+            match op {
+                OP_SET => {
+                    let key = BinaryCodec::read_string(&mut reader)?;
+                    current_cmd_len += 4 + key.len() as u64;
+                    
+                    let val_len = BinaryCodec::read_u32(&mut reader)? as u64;
+                    let val_pos = pos + current_cmd_len + 4; // +4 for val_len bytes
+                    
+                    // Skip value bytes
+                    reader.seek_relative(val_len as i64)?;
+                    
+                    current_cmd_len += 4 + val_len;
+                    
+                    data.insert(key, CommandPos { pos: val_pos, len: val_len });
                 }
-                "DEL" => {
-                    if parts.len() == 2 {
-                        match serde_json::from_str::<String>(parts[1]) {
-                            Ok(key) => {
-                                data.remove(&key);
-                            },
-                            Err(_) => {}
-                        }
-                    }
+                OP_DEL => {
+                    let key = BinaryCodec::read_string(&mut reader)?;
+                    current_cmd_len += 4 + key.len() as u64;
+                    data.remove(&key);
                 }
-                _ => {}
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid opcode")),
             }
             
-            pos += line_len;
-            line.clear();
+            pos += current_cmd_len;
         }
 
         Ok(Database {
@@ -111,18 +94,22 @@ impl Database {
     }
 
     pub fn set(&mut self, key: String, value: String) {
-        let key_json = serde_json::to_string(&key).expect("Failed to serialize key");
-        let value_json = serde_json::to_string(&value).expect("Failed to serialize value");
+        self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
         
-        let start_pos = self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
+        // Opcode
+        self.file.write_all(&[OP_SET]).expect("Failed to write opcode");
         
-        let line = format!("SET {} {}\n", key_json, value_json);
-        self.file.write_all(line.as_bytes()).expect("Failed to write to log");
+        // Key
+        BinaryCodec::write_string(&mut self.file, &key).expect("Failed to write key");
         
-        let value_offset = start_pos + 4 + key_json.len() as u64 + 1;
-        let value_len = value_json.len() as u64;
-
-        self.data.insert(key, CommandPos { pos: value_offset, len: value_len });
+        // Value
+        let val_len = value.len() as u32;
+        self.file.write_all(&val_len.to_le_bytes()).expect("Failed to write val len");
+        
+        let val_pos = self.file.stream_position().expect("Failed to get val pos");
+        self.file.write_all(value.as_bytes()).expect("Failed to write value");
+        
+        self.data.insert(key, CommandPos { pos: val_pos, len: val_len as u64 });
     }
 
     pub fn get(&mut self, key: &str) -> Option<String> {
@@ -132,17 +119,14 @@ impl Database {
         let mut buf = vec![0; cmd.len as usize];
         self.file.read_exact(&mut buf).expect("Failed to read value");
         
-        match serde_json::from_slice(&buf) {
-            Ok(val) => Some(val),
-            Err(_) => None, // Should not happen if log is consistent
-        }
+        String::from_utf8(buf).ok()
     }
 
     pub fn del(&mut self, key: &str) {
-        let key_json = serde_json::to_string(&key).expect("Failed to serialize key");
-        
         self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
-        writeln!(self.file, "DEL {}", key_json).expect("Failed to write to log");
+        
+        self.file.write_all(&[OP_DEL]).expect("Failed to write opcode");
+        BinaryCodec::write_string(&mut self.file, key).expect("Failed to write key");
         
         self.data.remove(key);
     }
@@ -166,18 +150,22 @@ impl Database {
                 let mut buf = vec![0; cmd.len as usize];
                 self.file.read_exact(&mut buf).expect("Failed to read");
                 
-                let key_json = serde_json::to_string(&key).expect("Failed to serialize key");
-                let value_json = String::from_utf8(buf).expect("Invalid UTF8");
+                let value = String::from_utf8(buf).expect("Invalid UTF8");
                 
-                let line = format!("SET {} {}\n", key_json, value_json);
-                tmp_file.write_all(line.as_bytes()).expect("Failed to write to temp file");
+                // Write to temp file
+                tmp_file.write_all(&[OP_SET]).expect("Failed to write opcode");
+                BinaryCodec::write_string(&mut tmp_file, &key).expect("Failed to write key");
                 
-                let value_offset = current_pos + 4 + key_json.len() as u64 + 1;
-                let value_len = value_json.len() as u64;
+                let val_len = value.len() as u32;
+                tmp_file.write_all(&val_len.to_le_bytes()).expect("Failed to write val len");
                 
-                new_data.insert(key, CommandPos { pos: value_offset, len: value_len });
+                let val_pos = current_pos + 1 + 4 + key.len() as u64 + 4;
+                tmp_file.write_all(value.as_bytes()).expect("Failed to write value");
                 
-                current_pos += line.len() as u64;
+                let key_len = key.len() as u64;
+                new_data.insert(key, CommandPos { pos: val_pos, len: val_len as u64 });
+                
+                current_pos += 1 + 4 + key_len + 4 + val_len as u64;
             }
         }
 
@@ -191,5 +179,29 @@ impl Database {
             .expect("Unable to reopen database file");
             
         self.data = new_data;
+    }
+}
+
+struct BinaryCodec;
+
+impl BinaryCodec {
+    fn write_string(writer: &mut impl Write, s: &str) -> io::Result<()> {
+        let len = s.len() as u32;
+        writer.write_all(&len.to_le_bytes())?;
+        writer.write_all(s.as_bytes())?;
+        Ok(())
+    }
+
+    fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn read_string(reader: &mut impl Read) -> io::Result<String> {
+        let len = Self::read_u32(reader)?;
+        let mut buf = vec![0u8; len as usize];
+        reader.read_exact(&mut buf)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }

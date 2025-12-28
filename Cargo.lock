@@ -388,7 +388,6 @@ dependencies = [
  "rand",
  "rstest",
  "serde",
- "serde_json",
  "sled",
  "tempfile",
 ]
