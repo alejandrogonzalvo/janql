@@ -48,6 +48,52 @@ jobs:
           # Run benchmarks and save baseline with the version tag
           cargo bench --bench benchmark_main -- --save-baseline v${{ env.VERSION }}
 
+      - name: Find Previous Baseline
+        id: find_prev_baseline
+        if: steps.check_baseline.outputs.skip == 'false'
+        run: |
+          # List all versions in the baseline directory
+          # Assuming structure: benches/baselines/database_ops/write/100/vX.Y.Z
+          BASE_DIR="benches/baselines/database_ops/write/100"
+          
+          if [ -d "$BASE_DIR" ]; then
+            # Get list of versions, sort them, and find the one before the current version
+            # We use sort -V for version sort
+            PREV_VERSION=$(ls -1 "$BASE_DIR" | grep "^v" | sort -V | grep -B 1 "v${{ env.VERSION }}" | head -n 1)
+            
+            if [ "$PREV_VERSION" == "v${{ env.VERSION }}" ] || [ -z "$PREV_VERSION" ]; then
+               echo "No previous baseline found."
+               echo "has_prev=false" >> $GITHUB_OUTPUT
+            else
+               echo "Found previous baseline: $PREV_VERSION"
+               echo "version=$PREV_VERSION" >> $GITHUB_OUTPUT
+               echo "has_prev=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Baseline directory not found."
+            echo "has_prev=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compare Benchmarks
+        if: steps.check_baseline.outputs.skip == 'false' && steps.find_prev_baseline.outputs.has_prev == 'true'
+        run: |
+          PREV_VERSION="${{ steps.find_prev_baseline.outputs.version }}"
+          CURRENT_VERSION="v${{ env.VERSION }}"
+          
+          echo "Comparing $CURRENT_VERSION against $PREV_VERSION"
+          
+          # Run comparison and capture output
+          cargo bench --bench benchmark_main -- --load-baseline "$CURRENT_VERSION" --baseline "$PREV_VERSION" > benchmark_comparison.txt 2>&1 || true
+          
+          cat benchmark_comparison.txt
+
+      - name: Upload Benchmark Comparison
+        if: steps.check_baseline.outputs.skip == 'false' && steps.find_prev_baseline.outputs.has_prev == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-comparison-${{ env.VERSION }}
+          path: benchmark_comparison.txt
+
       - name: Commit and Push Baseline
         if: steps.check_baseline.outputs.skip == 'false'
         run: |
