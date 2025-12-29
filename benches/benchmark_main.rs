@@ -60,6 +60,22 @@ fn benchmarks(c: &mut Criterion) {
                 let _ = Database::load(&db_path).unwrap();
             });
         });
+
+        // Get by Prefix Benchmark: Measure latency of `get_by_prefix`
+        group.bench_with_input(BenchmarkId::new("get_by_prefix", size), size, |b, &s| {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path().join("bench_prefix.db");
+            let mut db = Database::new(&db_path);
+            
+            // Pre-fill
+            for i in 0..s {
+                db.set(format!("key{}", i), "value".to_string());
+            }
+            
+            b.iter(|| {
+                db.get_by_prefix("key1");
+            });
+        });
     }
     group.finish();
 }
