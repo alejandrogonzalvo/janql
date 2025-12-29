@@ -119,3 +119,26 @@ fn test_persistence_deleted_key() {
     let mut loaded_db = Database::load(&db_path).expect("Failed to load database");
     assert_eq!(loaded_db.get("key1"), None);
 }
+
+#[rstest]
+fn test_get_by_prefix(mut db: TestDb) {
+    for i in 0..1000 {
+        db.set(format!("key{}", i), format!("value{}", i));
+    }
+
+    // Prefix "key1" should match:
+    // key1
+    // key10-key19 (10 keys)
+    // key100-key199 (100 keys)
+    // Total: 1 + 10 + 100 = 111 keys
+    let prefix = "key1";
+    
+    let results = db.get_by_prefix(prefix);
+    
+    assert_eq!(results.len(), 111);
+    
+    assert!(results.contains(&"value1".to_string()));
+    assert!(results.contains(&"value10".to_string()));
+    assert!(results.contains(&"value199".to_string()));
+    assert!(!results.contains(&"value200".to_string()));
+}
