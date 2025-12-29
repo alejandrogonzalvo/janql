@@ -122,6 +122,26 @@ impl Database {
         String::from_utf8(buf).ok()
     }
 
+    pub fn get_by_prefix(&mut self, prefix: &str) -> Vec<String> {
+        let mut results = Vec::new();
+        let keys: Vec<String> = self.data.keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+
+        for key in keys {
+            if let Some(cmd) = self.data.get(&key) {
+                self.file.seek(SeekFrom::Start(cmd.pos)).expect("Failed to seek");
+                let mut buf = vec![0; cmd.len as usize];
+                self.file.read_exact(&mut buf).expect("Failed to read value");
+                if let Ok(val) = String::from_utf8(buf) {
+                    results.push(val);
+                }
+            }
+        }
+        results
+    }
+
     pub fn del(&mut self, key: &str) {
         self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
         
