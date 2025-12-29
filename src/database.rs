@@ -1,227 +1,189 @@
-use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const OP_SET: u8 = 1;
-const OP_DEL: u8 = 2;
-
-#[derive(Debug, Clone, Copy)]
-struct CommandPos {
-    pos: u64,
-    len: u64,
-}
+use crate::memtable::MemTable;
+use crate::sstable::{SSTableBuilder, SSTableReader};
+use crate::wal::{WAL, WALIterator};
 
 pub struct Database {
-    data: HashMap<String, CommandPos>,
     pub path: PathBuf,
-    file: File,
+    memtable: MemTable,
+    wal: WAL,
+    sstables: Vec<SSTableReader>,
 }
+
+const MEMTABLE_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB
 
 impl Database {
     pub fn new(path: impl AsRef<Path>) -> Database {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true) 
-            .truncate(true)
-            .open(&path)
-            .expect("Unable to create database file");
+        
+        if !path.exists() {
+            fs::create_dir_all(&path).expect("Unable to create database directory");
+        }
+
+        let wal_path = path.join("wal.log");
+        let wal = WAL::new(&wal_path).expect("Unable to create WAL");
 
         Database {
-            data: HashMap::new(),
             path,
-            file,
+            memtable: MemTable::new(),
+            wal,
+            sstables: Vec::new(),
         }
     }
 
     pub fn load(path: impl AsRef<Path>) -> io::Result<Database> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
+        
+        if !path.exists() {
+             return Ok(Database::new(&path));
+        }
 
-        let mut data = HashMap::new();
-        let mut reader = BufReader::new(&file);
-        let mut pos = 0;
+        let wal_path = path.join("wal.log");
+        let wal = WAL::new(&wal_path)?;
+        let mut memtable = MemTable::new();
 
-        loop {
-            let mut op_buf = [0u8; 1];
-            match reader.read_exact(&mut op_buf) {
-                Ok(_) => {},
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            }
-            
-            let op = op_buf[0];
-            // 1 byte for op
-            let mut current_cmd_len = 1;
-
-            match op {
-                OP_SET => {
-                    let key = BinaryCodec::read_string(&mut reader)?;
-                    current_cmd_len += 4 + key.len() as u64;
-                    
-                    let val_len = BinaryCodec::read_u32(&mut reader)? as u64;
-                    let val_pos = pos + current_cmd_len + 4; // +4 for val_len bytes
-                    
-                    // Skip value bytes
-                    reader.seek_relative(val_len as i64)?;
-                    
-                    current_cmd_len += 4 + val_len;
-                    
-                    data.insert(key, CommandPos { pos: val_pos, len: val_len });
+        if wal_path.exists() {
+            let iter = WALIterator::new(&wal_path)?;
+            for entry in iter {
+                let (key, val) = entry?;
+                if let Some(v) = val {
+                    memtable.set(key, v);
+                } else {
+                    memtable.del(key);
                 }
-                OP_DEL => {
-                    let key = BinaryCodec::read_string(&mut reader)?;
-                    current_cmd_len += 4 + key.len() as u64;
-                    data.remove(&key);
-                }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid opcode")),
             }
-            
-            pos += current_cmd_len;
+        }
+
+        let mut sstables = Vec::new();
+        let entries = fs::read_dir(&path)?;
+        let mut sstable_files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "sst"))
+            .collect();
+        
+        sstable_files.sort();
+        sstable_files.reverse();
+
+        for sst_path in sstable_files {
+            sstables.push(SSTableReader::new(sst_path)?);
         }
 
         Ok(Database {
-            data,
             path,
-            file,
+            memtable,
+            wal,
+            sstables,
         })
     }
 
     pub fn set(&mut self, key: String, value: String) {
-        self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
-        
-        // Opcode
-        self.file.write_all(&[OP_SET]).expect("Failed to write opcode");
-        
-        // Key
-        BinaryCodec::write_string(&mut self.file, &key).expect("Failed to write key");
-        
-        // Value
-        let val_len = value.len() as u32;
-        self.file.write_all(&val_len.to_le_bytes()).expect("Failed to write val len");
-        
-        let val_pos = self.file.stream_position().expect("Failed to get val pos");
-        self.file.write_all(value.as_bytes()).expect("Failed to write value");
-        
-        self.data.insert(key, CommandPos { pos: val_pos, len: val_len as u64 });
+        self.wal.set(&key, &value).expect("Failed to write to WAL");
+        self.memtable.set(key, value);
+
+        if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
+            self.flush_memtable().expect("Failed to flush memtable");
+        }
+    }
+
+    pub fn batch_set(&mut self, entries: Vec<(String, String)>) {
+        self.wal.batch_set(&entries).expect("Failed to write to WAL");
+        for (key, value) in entries {
+            self.memtable.set(key, value);
+        }
+
+        if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
+            self.flush_memtable().expect("Failed to flush memtable");
+        }
     }
 
     pub fn get(&mut self, key: &str) -> Option<String> {
-        let cmd = self.data.get(key)?;
-        
-        self.file.seek(SeekFrom::Start(cmd.pos)).expect("Failed to seek");
-        let mut buf = vec![0; cmd.len as usize];
-        self.file.read_exact(&mut buf).expect("Failed to read value");
-        
-        String::from_utf8(buf).ok()
-    }
+        if let Some(val_opt) = self.memtable.get(key) {
+            return val_opt;
+        }
 
-    pub fn get_by_prefix(&mut self, prefix: &str) -> Vec<String> {
-        let mut results = Vec::new();
-        let keys: Vec<String> = self.data.keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-
-        for key in keys {
-            if let Some(cmd) = self.data.get(&key) {
-                self.file.seek(SeekFrom::Start(cmd.pos)).expect("Failed to seek");
-                let mut buf = vec![0; cmd.len as usize];
-                self.file.read_exact(&mut buf).expect("Failed to read value");
-                if let Ok(val) = String::from_utf8(buf) {
-                    results.push(val);
-                }
+        for sstable in &mut self.sstables {
+            if let Ok(Some(val)) = sstable.get(key) {
+                return Some(val);
             }
         }
-        results
+
+        None
     }
 
     pub fn del(&mut self, key: &str) {
-        self.file.seek(SeekFrom::End(0)).expect("Failed to seek");
+        self.wal.del(key).expect("Failed to write to WAL");
+        self.memtable.del(key.to_string());
         
-        self.file.write_all(&[OP_DEL]).expect("Failed to write opcode");
-        BinaryCodec::write_string(&mut self.file, key).expect("Failed to write key");
-        
-        self.data.remove(key);
+        if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
+            self.flush_memtable().expect("Failed to flush memtable");
+        }
     }
 
-    pub fn flush(&mut self) {
-        let tmp_path = self.path.with_extension("tmp");
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .expect("Unable to create temp file for compaction");
+    pub fn get_by_prefix(&mut self, prefix: &str) -> Vec<String> {
+        let mut map = std::collections::BTreeMap::new();
 
-        let keys: Vec<String> = self.data.keys().cloned().collect();
-        let mut new_data = HashMap::new();
-        let mut current_pos = 0;
-
-        for key in keys {
-            if let Some(cmd) = self.data.get(&key) {
-                self.file.seek(SeekFrom::Start(cmd.pos)).expect("Failed to seek");
-                let mut buf = vec![0; cmd.len as usize];
-                self.file.read_exact(&mut buf).expect("Failed to read");
-                
-                let value = String::from_utf8(buf).expect("Invalid UTF8");
-                
-                // Write to temp file
-                tmp_file.write_all(&[OP_SET]).expect("Failed to write opcode");
-                BinaryCodec::write_string(&mut tmp_file, &key).expect("Failed to write key");
-                
-                let val_len = value.len() as u32;
-                tmp_file.write_all(&val_len.to_le_bytes()).expect("Failed to write val len");
-                
-                let val_pos = current_pos + 1 + 4 + key.len() as u64 + 4;
-                tmp_file.write_all(value.as_bytes()).expect("Failed to write value");
-                
-                let key_len = key.len() as u64;
-                new_data.insert(key, CommandPos { pos: val_pos, len: val_len as u64 });
-                
-                current_pos += 1 + 4 + key_len + 4 + val_len as u64;
+        // 1. Scan SSTables (oldest to newest, so newer overwrites older)
+        for sstable in self.sstables.iter_mut().rev() {
+            let start = prefix;
+            let end = format!("{}{}", prefix, '\u{10FFFF}'); // Max char
+            
+            if let Ok(entries) = sstable.scan(start, &end) {
+                for (k, v) in entries {
+                    map.insert(k, Some(v));
+                }
             }
         }
 
-        fs::rename(&tmp_path, &self.path).expect("Failed to replace database file");
+        // 2. Scan MemTable
+        for (k, v) in self.memtable.iter() {
+            if k.starts_with(prefix) {
+                map.insert(k.clone(), v.clone());
+            }
+        }
+
+        // 3. Collect results (filter out tombstones)
+        map.into_values().flatten().collect()
+    }
+
+    pub fn flush(&mut self) {
+        self.flush_memtable().expect("Failed to flush");
+    }
+
+    fn flush_memtable(&mut self) -> io::Result<()> {
+        if self.memtable.len() == 0 {
+            return Ok(());
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
         
-        self.file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)
-            .expect("Unable to reopen database file");
-            
-        self.data = new_data;
-    }
-}
+        let sst_name = format!("sstable_{}.sst", timestamp);
+        let sst_path = self.path.join(sst_name);
 
-struct BinaryCodec;
+        let mut builder = SSTableBuilder::new(&sst_path)?;
 
-impl BinaryCodec {
-    fn write_string(writer: &mut impl Write, s: &str) -> io::Result<()> {
-        let len = s.len() as u32;
-        writer.write_all(&len.to_le_bytes())?;
-        writer.write_all(s.as_bytes())?;
+        for (key, val_opt) in self.memtable.iter() {
+            if let Some(val) = val_opt {
+                builder.add(key, val)?;
+            }
+        }
+        
+        builder.finish()?;
+
+        // Add to list (at the front, as it's newest)
+        self.sstables.insert(0, SSTableReader::new(sst_path)?);
+
+        // Clear MemTable and WAL
+        self.memtable.clear();
+        self.wal.clear()?;
+
         Ok(())
-    }
-
-    fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    }
-
-    fn read_string(reader: &mut impl Read) -> io::Result<String> {
-        let len = Self::read_u32(reader)?;
-        let mut buf = vec![0u8; len as usize];
-        reader.read_exact(&mut buf)?;
-        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }

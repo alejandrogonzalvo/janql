@@ -56,14 +56,15 @@ fn test_delete_non_existent_key(mut db: TestDb) {
 
 #[rstest]
 fn test_log_append(mut db: TestDb) {
-    let initial_size = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    let wal_path = db.path.join("wal.log");
+    let initial_size = fs::metadata(&wal_path).expect("Unable to read metadata").len();
     
     db.set("key1".to_string(), "value1".to_string());
-    let size_after_set = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    let size_after_set = fs::metadata(&wal_path).expect("Unable to read metadata").len();
     assert!(size_after_set > initial_size);
     
     db.del("key1");
-    let size_after_del = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    let size_after_del = fs::metadata(&wal_path).expect("Unable to read metadata").len();
     assert!(size_after_del > size_after_set);
     
     // Verify content by loading
@@ -77,17 +78,22 @@ fn test_flush_database(mut db: TestDb) {
     db.set("key2".to_string(), "value2".to_string());
     db.del("key1");
     
-    let size_before = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    let wal_path = db.path.join("wal.log");
+    let size_before = fs::metadata(&wal_path).expect("Unable to read metadata").len();
     
     db.flush();
 
-    let size_after = fs::metadata(&db.path).expect("Unable to read metadata").len();
+    let size_after = fs::metadata(&wal_path).expect("Unable to read metadata").len();
     
-    // Size should decrease because key1 and its deletion are removed
+    // WAL should be cleared (or just header)
     assert!(size_after < size_before);
 
     let mut loaded_db = Database::load(&db.path).expect("Failed to load database");
     assert_eq!(loaded_db.get("key2"), Some("value2".to_string()));
+    // Note: In current implementation, deletions are not persisted to SSTable, 
+    // so key1 might reappear if it was in an older SSTable. 
+    // But here key1 was only in MemTable, so it's just gone.
+    // However, if we query it, it shouldn't be found.
     assert_eq!(loaded_db.get("key1"), None);
 }
 

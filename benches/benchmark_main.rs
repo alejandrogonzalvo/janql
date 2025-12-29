@@ -14,9 +14,10 @@ fn benchmarks(c: &mut Criterion) {
             let mut db = Database::new(&db_path);
             
             // Pre-fill to `size`
-            for i in 0..s {
-                 db.set(format!("key{}", i), "value".to_string());
-            }
+            let entries: Vec<(String, String)> = (0..s)
+                .map(|i| (format!("key{}", i), "value".to_string()))
+                .collect();
+            db.batch_set(entries);
             
             let mut i = s;
             b.iter(|| {
@@ -32,9 +33,10 @@ fn benchmarks(c: &mut Criterion) {
             let mut db = Database::new(&db_path);
             
             // Pre-fill
-            for i in 0..s {
-                db.set(format!("key{}", i), "value".to_string());
-            }
+            let entries: Vec<(String, String)> = (0..s)
+                .map(|i| (format!("key{}", i), "value".to_string()))
+                .collect();
+            db.batch_set(entries);
             
             let mut i = 0;
             b.iter(|| {
@@ -51,9 +53,10 @@ fn benchmarks(c: &mut Criterion) {
             // Pre-fill
             {
                 let mut db = Database::new(&db_path);
-                for i in 0..s {
-                    db.set(format!("key{}", i), "value".to_string());
-                }
+                let entries: Vec<(String, String)> = (0..s)
+                    .map(|i| (format!("key{}", i), "value".to_string()))
+                    .collect();
+                db.batch_set(entries);
             }
 
             b.iter(|| {
@@ -68,9 +71,10 @@ fn benchmarks(c: &mut Criterion) {
             let mut db = Database::new(&db_path);
             
             // Pre-fill
-            for i in 0..s {
-                db.set(format!("key{}", i), "value".to_string());
-            }
+            let entries: Vec<(String, String)> = (0..s)
+                .map(|i| (format!("key{}", i), "value".to_string()))
+                .collect();
+            db.batch_set(entries);
             
             b.iter(|| {
                 db.get_by_prefix("key1");
