@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::memtable::MemTable;
-use crate::sstable::{SSTableBuilder, SSTableReader};
+use crate::sstable::{SSTableBuilder, SSTableReader, SearchResult};
 use crate::wal::{WAL, WALIterator};
 
 pub struct Database {
@@ -19,7 +19,7 @@ const MEMTABLE_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB
 impl Database {
     pub fn new(path: impl AsRef<Path>) -> Database {
         let path = path.as_ref().to_path_buf();
-        
+
         if !path.exists() {
             fs::create_dir_all(&path).expect("Unable to create database directory");
         }
@@ -37,9 +37,9 @@ impl Database {
 
     pub fn load(path: impl AsRef<Path>) -> io::Result<Database> {
         let path = path.as_ref().to_path_buf();
-        
+
         if !path.exists() {
-             return Ok(Database::new(&path));
+            return Ok(Database::new(&path));
         }
 
         let wal_path = path.join("wal.log");
@@ -65,7 +65,7 @@ impl Database {
             .map(|e| e.path())
             .filter(|p| p.extension().map_or(false, |ext| ext == "sst"))
             .collect();
-        
+
         sstable_files.sort();
         sstable_files.reverse();
 
@@ -91,7 +91,9 @@ impl Database {
     }
 
     pub fn batch_set(&mut self, entries: Vec<(String, String)>) {
-        self.wal.batch_set(&entries).expect("Failed to write to WAL");
+        self.wal
+            .batch_set(&entries)
+            .expect("Failed to write to WAL");
         for (key, value) in entries {
             self.memtable.set(key, value);
         }
@@ -107,8 +109,11 @@ impl Database {
         }
 
         for sstable in &mut self.sstables {
-            if let Ok(Some(val)) = sstable.get(key) {
-                return Some(val);
+            match sstable.get(key) {
+                Ok(SearchResult::Found(val)) => return Some(val),
+                Ok(SearchResult::Deleted) => return None,
+                Ok(SearchResult::NotFound) => continue,
+                Err(_) => continue, // Should handle error appropriately, but for now continue
             }
         }
 
@@ -118,7 +123,7 @@ impl Database {
     pub fn del(&mut self, key: &str) {
         self.wal.del(key).expect("Failed to write to WAL");
         self.memtable.del(key.to_string());
-        
+
         if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
             self.flush_memtable().expect("Failed to flush memtable");
         }
@@ -131,7 +136,7 @@ impl Database {
         for sstable in self.sstables.iter_mut().rev() {
             let start = prefix;
             let end = format!("{}{}", prefix, '\u{10FFFF}'); // Max char
-            
+
             if let Ok(entries) = sstable.scan(start, &end) {
                 for (k, v) in entries {
                     map.insert(k, Some(v));
@@ -163,7 +168,7 @@ impl Database {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros();
-        
+
         let sst_name = format!("sstable_{}.sst", timestamp);
         let sst_path = self.path.join(sst_name);
 
@@ -172,9 +177,11 @@ impl Database {
         for (key, val_opt) in self.memtable.iter() {
             if let Some(val) = val_opt {
                 builder.add(key, val)?;
+            } else {
+                builder.delete(key)?;
             }
         }
-        
+
         builder.finish()?;
 
         // Add to list (at the front, as it's newest)
@@ -183,6 +190,95 @@ impl Database {
         // Clear MemTable and WAL
         self.memtable.clear();
         self.wal.clear()?;
+
+        Ok(())
+    }
+
+    pub fn compact(&mut self) -> io::Result<()> {
+        self.flush_memtable()?;
+
+        if self.sstables.is_empty() {
+            return Ok(());
+        }
+
+        let old_sstables = std::mem::take(&mut self.sstables);
+
+        let mut iters: Vec<_> = old_sstables
+            .into_iter()
+            .map(|sst| sst.into_iter().peekable())
+            .collect();
+
+        // 3. Start new SSTable
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros();
+        let new_sst_name = format!("sstable_compacted_{}.sst", timestamp);
+        let new_sst_path = self.path.join(&new_sst_name);
+
+        let mut builder = SSTableBuilder::new(&new_sst_path)?;
+
+        // 5. Merge Loop
+        loop {
+            // Find the iterator with the smallest key
+            let mut best_idx = None;
+            let mut min_key: Option<&String> = None;
+
+            for (i, iter) in iters.iter_mut().enumerate() {
+                if let Some(Ok((key, _))) = iter.peek() {
+                    if min_key.map_or(true, |mk| key < mk) {
+                        min_key = Some(key);
+                        best_idx = Some(i);
+                    }
+                }
+            }
+
+            if let Some(idx) = best_idx {
+                // Consume the element from best_idx
+                let (key, val) = iters[idx].next().unwrap()?;
+                eprintln!("Selected from Iter {}: key={}, val={:?}", idx, key, val);
+
+                if let Some(v) = val {
+                    builder.add(&key, &v)?;
+                }
+
+                // Advance other iterators if they have the same key
+                for (i, iter) in iters.iter_mut().enumerate() {
+                    if i == idx {
+                        continue;
+                    }
+
+                    if let Some(Ok((k, _))) = iter.peek() {
+                        if k == &key {
+                            iter.next(); // Discard shadowed version
+                        }
+                    }
+                }
+            } else {
+                // No more elements
+                break;
+            }
+        }
+
+        builder.finish()?;
+
+        // 6. Delete old files
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(ext) = path.extension() {
+                if ext != "sst" {
+                    continue;
+                }
+
+                if path.file_name() != Some(std::ffi::OsStr::new(&new_sst_name)) {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+
+        // 7. Update self.sstables
+        self.sstables = vec![SSTableReader::new(new_sst_path)?];
 
         Ok(())
     }
