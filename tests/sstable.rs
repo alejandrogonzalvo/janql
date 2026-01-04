@@ -1,4 +1,4 @@
-use janql::sstable::{SSTableBuilder, SSTableReader};
+use janql::sstable::{SSTableBuilder, SSTableReader, SearchResult};
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 
@@ -32,15 +32,15 @@ fn test_sstable_segmentation() {
 
     // Verify all keys
     for (key, value) in &data {
-        let res = reader.get(key).expect("Failed to get").expect("Key not found");
-        assert_eq!(res, *value);
+        let res = reader.get(key).expect("Failed to get");
+        assert_eq!(res, SearchResult::Found(value.clone()));
     }
 
     // Verify range scan
     let start = "key0010";
     let end = "key0020";
     let range_res = reader.scan(start, end).expect("Failed to scan");
-    
+
     assert_eq!(range_res.len(), 11); // 10 to 20 inclusive
     for (k, v) in range_res {
         assert_eq!(v, *data.get(&k).unwrap());

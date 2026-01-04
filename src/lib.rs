@@ -1,6 +1,6 @@
 pub mod database;
-pub mod sstable;
 pub mod memtable;
+pub mod sstable;
 pub mod wal;
 
-pub use database::Database;
+pub use database::{CompactionPolicy, Database};
