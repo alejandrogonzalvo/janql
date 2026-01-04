@@ -6,12 +6,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::memtable::MemTable;
 use crate::sstable::{SSTableBuilder, SSTableReader, SearchResult};
 use crate::wal::{WAL, WALIterator};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactionPolicy {
+    Disabled,
+    Periodic(Duration),
+}
 
 pub struct Database {
     pub path: PathBuf,
     memtable: MemTable,
     wal: WAL,
     sstables: Vec<SSTableReader>,
+    compaction_policy: CompactionPolicy,
+    last_compaction_time: SystemTime,
 }
 
 const MEMTABLE_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB
@@ -32,6 +41,8 @@ impl Database {
             memtable: MemTable::new(),
             wal,
             sstables: Vec::new(),
+            compaction_policy: CompactionPolicy::Disabled,
+            last_compaction_time: SystemTime::now(),
         }
     }
 
@@ -78,7 +89,29 @@ impl Database {
             memtable,
             wal,
             sstables,
+            compaction_policy: CompactionPolicy::Disabled,
+            last_compaction_time: SystemTime::now(),
         })
+    }
+
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) {
+        self.compaction_policy = policy;
+    }
+
+    fn try_trigger_compaction(&mut self) -> io::Result<()> {
+        let duration = match self.compaction_policy {
+            CompactionPolicy::Periodic(d) => d,
+            CompactionPolicy::Disabled => return Ok(()),
+        };
+
+        if self
+            .last_compaction_time
+            .elapsed()
+            .map_or(false, |e| e >= duration)
+        {
+            self.compact()?;
+        }
+        Ok(())
     }
 
     pub fn set(&mut self, key: String, value: String) {
@@ -88,6 +121,9 @@ impl Database {
         if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
             self.flush_memtable().expect("Failed to flush memtable");
         }
+
+        self.try_trigger_compaction()
+            .expect("Auto-compaction failed");
     }
 
     pub fn batch_set(&mut self, entries: Vec<(String, String)>) {
@@ -101,6 +137,9 @@ impl Database {
         if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
             self.flush_memtable().expect("Failed to flush memtable");
         }
+
+        self.try_trigger_compaction()
+            .expect("Auto-compaction failed");
     }
 
     pub fn get(&mut self, key: &str) -> Option<String> {
@@ -127,6 +166,9 @@ impl Database {
         if self.memtable.size_bytes() >= MEMTABLE_THRESHOLD {
             self.flush_memtable().expect("Failed to flush memtable");
         }
+
+        self.try_trigger_compaction()
+            .expect("Auto-compaction failed");
     }
 
     pub fn get_by_prefix(&mut self, prefix: &str) -> Vec<String> {
@@ -279,6 +321,9 @@ impl Database {
 
         // 7. Update self.sstables
         self.sstables = vec![SSTableReader::new(new_sst_path)?];
+
+        // Update timestamp
+        self.last_compaction_time = SystemTime::now();
 
         Ok(())
     }
